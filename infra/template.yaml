@@ -99,7 +99,18 @@ Resources:
               StringEquals:
                 "aws:SourceAccount": !Ref AWS::AccountId
               ArnLike:
-                "aws:SourceArn": !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:model-invocation-logging"
+                "aws:SourceArn": !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:*"
+          - Sid: AllowBedrockGetBucketVersioning
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: "s3:GetBucketVersioning"
+            Resource: !GetAtt LogBucket.Arn
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              ArnLike:
+                "aws:SourceArn": !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:*"
 
   # ------------------------------------------------------------------
   # Glue Catalog — Athena 조회 대상 (파티션 프로젝션으로 MSCK REPAIR 불필요)
