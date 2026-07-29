@@ -1,0 +1,732 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Bedrock 사용량 기반 비용 통제 시스템 (Athena 로그 집계 + 예산 초과 시 IAM Deny 차단).
+  어느 AWS 계정에서도 재현 가능하도록 파라미터화된 SAM 템플릿.
+
+Parameters:
+  ProjectPrefix:
+    Type: String
+    Default: bedrock-budget
+    Description: 리소스 이름 접두사
+
+  DefaultBudgetLimitUsd:
+    Type: Number
+    Default: 60
+    Description: 개인별 한도가 없는 사용자에게 적용되는 기본 월 예산(USD)
+
+  SesSenderEmail:
+    Type: String
+    Default: ""
+    Description: 예산 초과 알림을 보낼 SES 인증된 발신자 이메일. 비워두면 알림 비활성화.
+
+  ManagedPolicyMaxUsers:
+    Type: Number
+    Default: 150
+    Description: Deny 정책 1개당 최대 차단 인원 (IAM 정책 크기 제한에 따른 값)
+
+  MaxManagedPolicies:
+    Type: Number
+    Default: 9
+    Description: 생성할 Deny 관리형 정책 개수 (최대 차단 인원 = MaxManagedPolicies x ManagedPolicyMaxUsers)
+
+  TrustedPrincipalArns:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      ClaudeCodeAccess IAM 역할을 assume 할 수 있는 principal ARN 목록(콤마 구분).
+      IAM Identity Center 권한 세트와 연동 시, 해당 권한 세트가 생성하는 역할과는 별개로
+      이 역할을 직접 사용하거나, Deny 정책을 SSO 역할에도 추가로 attach 하십시오 (README 참고).
+
+Conditions:
+  HasTrustedPrincipals: !Not [!Equals [!Select [0, !Ref TrustedPrincipalArns], ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 60
+    MemorySize: 128
+    Architectures: [arm64]
+
+Resources:
+  # ------------------------------------------------------------------
+  # S3 — Bedrock invocation 로그 + Athena 쿼리 결과 저장
+  # ------------------------------------------------------------------
+  LogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectPrefix}-data-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAthenaResults
+            Prefix: athena-results/
+            Status: Enabled
+            ExpirationInDays: 30
+
+  LogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt LogBucket.Arn
+              - !Sub "${LogBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+          - Sid: AllowBedrockLogDelivery
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: "s3:PutObject"
+            Resource: !Sub "${LogBucket.Arn}/AWSLogs/${AWS::AccountId}/BedrockModelInvocationLogs/*"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              ArnLike:
+                "aws:SourceArn": !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:model-invocation-logging"
+
+  # ------------------------------------------------------------------
+  # Glue Catalog — Athena 조회 대상 (파티션 프로젝션으로 MSCK REPAIR 불필요)
+  # ------------------------------------------------------------------
+  BedrockLogsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: bedrock_logs
+
+  InvocationsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref BedrockLogsDatabase
+      TableInput:
+        Name: invocations
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          "projection.enabled": "true"
+          "projection.dt.type": "date"
+          "projection.dt.range": "2024/01/01,NOW"
+          "projection.dt.format": "yyyy/MM/dd"
+          "projection.dt.interval": "1"
+          "projection.dt.interval.unit": "DAYS"
+          "storage.location.template": !Sub "s3://${LogBucket}/AWSLogs/${AWS::AccountId}/BedrockModelInvocationLogs/${!dt}"
+        PartitionKeys:
+          - Name: dt
+            Type: string
+        StorageDescriptor:
+          Location: !Sub "s3://${LogBucket}/AWSLogs/${AWS::AccountId}/BedrockModelInvocationLogs/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              "ignore.malformed.json": "true"
+          Columns:
+            - Name: schematype
+              Type: string
+            - Name: schemaversion
+              Type: string
+            - Name: timestamp
+              Type: string
+            - Name: accountid
+              Type: string
+            - Name: identity
+              Type: "struct<arn:string>"
+            - Name: region
+              Type: string
+            - Name: requestid
+              Type: string
+            - Name: operation
+              Type: string
+            - Name: modelid
+              Type: string
+            - Name: input
+              Type: "struct<inputcontenttype:string,inputtokencount:int,cachereadinputtokencount:int,cachewriteinputtokencount:int,inputbodyjson:string>"
+            - Name: output
+              Type: "struct<outputcontenttype:string,outputtokencount:int,outputbodyjson:string>"
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${ProjectPrefix}-primary"
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${LogBucket}/athena-results/"
+        EnforceWorkGroupConfiguration: false
+
+  # ------------------------------------------------------------------
+  # DynamoDB
+  # ------------------------------------------------------------------
+  UserCostsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectPrefix}-user-costs"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: month
+          AttributeType: S
+        - AttributeName: identity_arn
+          AttributeType: S
+      KeySchema:
+        - AttributeName: month
+          KeyType: HASH
+        - AttributeName: identity_arn
+          KeyType: RANGE
+
+  UserCostsLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectPrefix}-user-costs-log"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: date
+          AttributeType: S
+        - AttributeName: identity_arn
+          AttributeType: S
+      KeySchema:
+        - AttributeName: date
+          KeyType: HASH
+        - AttributeName: identity_arn
+          KeyType: RANGE
+
+  UserBudgetTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectPrefix}-user-budget"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: month
+          AttributeType: S
+        - AttributeName: identity_arn
+          AttributeType: S
+      KeySchema:
+        - AttributeName: month
+          KeyType: HASH
+        - AttributeName: identity_arn
+          KeyType: RANGE
+
+  # ------------------------------------------------------------------
+  # IAM — Deny 정책 (예산 초과 차단용) + ClaudeCodeAccess 역할
+  # ------------------------------------------------------------------
+  ClaudeCodeAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ClaudeCodeAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          !If
+            - HasTrustedPrincipals
+            - - Effect: Allow
+                Principal:
+                  AWS: !Ref TrustedPrincipalArns
+                Action: "sts:AssumeRole"
+            - - Effect: Allow
+                Principal:
+                  AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+                Action: "sts:AssumeRole"
+                Condition:
+                  Bool:
+                    "aws:MultiFactorAuthPresent": "false"
+      Policies:
+        - PolicyName: BedrockInvokeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetInferenceProfile
+                Resource: "*"
+
+  BedrockBudgetDenyPolicy1:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: BedrockBudgetDeny_1
+      Roles: [!Ref ClaudeCodeAccessRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyBedrockForBudgetExceededUsers
+            Effect: Deny
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+            Condition:
+              StringLike:
+                "aws:userid": ["*:nobody"]
+
+  BedrockBudgetDenyPolicy2:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: BedrockBudgetDeny_2
+      Roles: [!Ref ClaudeCodeAccessRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyBedrockForBudgetExceededUsers
+            Effect: Deny
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+            Condition:
+              StringLike:
+                "aws:userid": ["*:nobody"]
+
+  BedrockBudgetDenyPolicy3:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: BedrockBudgetDeny_3
+      Roles: [!Ref ClaudeCodeAccessRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyBedrockForBudgetExceededUsers
+            Effect: Deny
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+            Condition:
+              StringLike:
+                "aws:userid": ["*:nobody"]
+
+  BedrockBudgetDenyPolicy4:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: BedrockBudgetDeny_4
+      Roles: [!Ref ClaudeCodeAccessRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyBedrockForBudgetExceededUsers
+            Effect: Deny
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+            Condition:
+              StringLike:
+                "aws:userid": ["*:nobody"]
+
+  BedrockBudgetDenyPolicy5:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: BedrockBudgetDeny_5
+      Roles: [!Ref ClaudeCodeAccessRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyBedrockForBudgetExceededUsers
+            Effect: Deny
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+            Condition:
+              StringLike:
+                "aws:userid": ["*:nobody"]
+
+  BedrockBudgetDenyPolicy6:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: BedrockBudgetDeny_6
+      Roles: [!Ref ClaudeCodeAccessRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyBedrockForBudgetExceededUsers
+            Effect: Deny
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+            Condition:
+              StringLike:
+                "aws:userid": ["*:nobody"]
+
+  BedrockBudgetDenyPolicy7:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: BedrockBudgetDeny_7
+      Roles: [!Ref ClaudeCodeAccessRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyBedrockForBudgetExceededUsers
+            Effect: Deny
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+            Condition:
+              StringLike:
+                "aws:userid": ["*:nobody"]
+
+  BedrockBudgetDenyPolicy8:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: BedrockBudgetDeny_8
+      Roles: [!Ref ClaudeCodeAccessRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyBedrockForBudgetExceededUsers
+            Effect: Deny
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+            Condition:
+              StringLike:
+                "aws:userid": ["*:nobody"]
+
+  BedrockBudgetDenyPolicy9:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: BedrockBudgetDeny_9
+      Roles: [!Ref ClaudeCodeAccessRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyBedrockForBudgetExceededUsers
+            Effect: Deny
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+            Condition:
+              StringLike:
+                "aws:userid": ["*:nobody"]
+
+  # ------------------------------------------------------------------
+  # API Gateway (IAM SigV4 인증)
+  # ------------------------------------------------------------------
+  BudgetApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${ProjectPrefix}-api"
+      StageName: prod
+      Auth:
+        DefaultAuthorizer: AWS_IAM
+
+  ComplianceApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${ProjectPrefix}-compliance-api"
+      StageName: prod
+      Auth:
+        DefaultAuthorizer: AWS_IAM
+
+  # ------------------------------------------------------------------
+  # Lambda — BedrockAthenaLogQueryLambda (집계, 5분 주기)
+  # ------------------------------------------------------------------
+  AthenaLogQueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: BedrockAthenaLogQueryLambda
+      CodeUri: ../src/athena_log_query/
+      Handler: lambda_function.lambda_handler
+      MemorySize: 256
+      Timeout: 300
+      Environment:
+        Variables:
+          ATHENA_DATABASE: !Ref BedrockLogsDatabase
+          ATHENA_TABLE: !Ref InvocationsTable
+          ATHENA_OUTPUT_S3: !Sub "s3://${LogBucket}/athena-results/"
+          ATHENA_WORKGROUP: !Ref AthenaWorkgroup
+          DYNAMODB_TABLE: !Ref UserCostsTable
+          DYNAMODB_LOG_TABLE: !Ref UserCostsLogTable
+          BLOCK_ALERT_FUNCTION_NAME: !Ref BlockAlertFunction
+      Policies:
+        - AthenaQueryFullAccess
+        - S3ReadPolicy:
+            BucketName: !Ref LogBucket
+        - S3WritePolicy:
+            BucketName: !Ref LogBucket
+        - DynamoDBWritePolicy:
+            TableName: !Ref UserCostsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref UserCostsLogTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - glue:GetDatabase
+                - glue:GetTable
+                - glue:GetPartitions
+                - glue:GetPartition
+                - glue:BatchGetPartition
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - bedrock:ListInferenceProfiles
+                - bedrock:GetInferenceProfile
+              Resource: "*"
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt BlockAlertFunction.Arn
+
+  AthenaLogQuerySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: BedrockAthenaLogQueryLambda-Schedule
+      ScheduleExpression: rate(5 minutes)
+      ScheduleExpressionTimezone: Asia/Seoul
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: ENABLED
+      Target:
+        Arn: !GetAtt AthenaLogQueryFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 185
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BB-Scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: InvokeAthenaLogQuery
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt AthenaLogQueryFunction.Arn
+
+  # ------------------------------------------------------------------
+  # Lambda — BedrocBlockAlertLambda (예산 초과 차단 판정)
+  # ------------------------------------------------------------------
+  BlockAlertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: BedrocBlockAlertLambda
+      CodeUri: ../src/block_alert/
+      Handler: lambda_function.lambda_handler
+      MemorySize: 256
+      Timeout: 300
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref UserCostsTable
+          BUDGET_TABLE: !Ref UserBudgetTable
+          BUDGET_LIMIT: !Ref DefaultBudgetLimitUsd
+          SES_SENDER_EMAIL: !Ref SesSenderEmail
+          DENY_POLICY_PREFIX: BedrockBudgetDeny
+          MANAGED_POLICY_MAX_USERS: !Ref ManagedPolicyMaxUsers
+          MAX_MANAGED_POLICIES: !Ref MaxManagedPolicies
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref UserCostsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref UserBudgetTable
+        - CloudWatchPutMetricPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - iam:GetPolicy
+                - iam:GetPolicyVersion
+                - iam:ListPolicyVersions
+                - iam:CreatePolicyVersion
+                - iam:DeletePolicyVersion
+              Resource:
+                - !Ref BedrockBudgetDenyPolicy1
+                - !Ref BedrockBudgetDenyPolicy2
+                - !Ref BedrockBudgetDenyPolicy3
+                - !Ref BedrockBudgetDenyPolicy4
+                - !Ref BedrockBudgetDenyPolicy5
+                - !Ref BedrockBudgetDenyPolicy6
+                - !Ref BedrockBudgetDenyPolicy7
+                - !Ref BedrockBudgetDenyPolicy8
+                - !Ref BedrockBudgetDenyPolicy9
+            - Effect: Allow
+              Action: sts:GetCallerIdentity
+              Resource: "*"
+
+  # ------------------------------------------------------------------
+  # Lambda — BedrockBudget-GetMyUsage
+  # ------------------------------------------------------------------
+  GetMyUsageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: BedrockBudget-GetMyUsage
+      CodeUri: ../src/get_my_usage/
+      Handler: lambda_function.lambda_handler
+      MemorySize: 128
+      Timeout: 60
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref UserCostsTable
+          BUDGET_TABLE: !Ref UserBudgetTable
+          BUDGET_LIMIT: !Ref DefaultBudgetLimitUsd
+          IDENTITY_ARN_TEMPLATE: !Sub "arn:aws:sts::${AWS::AccountId}:assumed-role/ClaudeCodeAccess/{session_name}"
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref UserCostsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref UserBudgetTable
+      Events:
+        GetUsage:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BudgetApi
+            Path: /usage
+            Method: GET
+
+  # ------------------------------------------------------------------
+  # Lambda — BedrockBudget-ManageUserBudget
+  # ------------------------------------------------------------------
+  ManageUserBudgetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: BedrockBudget-ManageUserBudget
+      CodeUri: ../src/manage_user_budget/
+      Handler: lambda_function.lambda_handler
+      MemorySize: 128
+      Timeout: 60
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref UserBudgetTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UserBudgetTable
+      Events:
+        GetBudget:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BudgetApi
+            Path: /budget
+            Method: GET
+        PutBudget:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BudgetApi
+            Path: /budget
+            Method: PUT
+
+  # ------------------------------------------------------------------
+  # Lambda — BedrockBudget-GetDailyCostLog
+  # ------------------------------------------------------------------
+  GetDailyCostLogFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: BedrockBudget-GetDailyCostLog
+      CodeUri: ../src/get_daily_cost_log/
+      Handler: lambda_function.lambda_handler
+      MemorySize: 128
+      Timeout: 60
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref UserCostsLogTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref UserCostsLogTable
+      Events:
+        GetDailyLog:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BudgetApi
+            Path: /dailylog
+            Method: GET
+
+  # ------------------------------------------------------------------
+  # Lambda — bedrock-history-api (컴플라이언스 조회)
+  # ------------------------------------------------------------------
+  HistoryApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: bedrock-history-api
+      CodeUri: ../src/history_api/
+      Handler: lambda_function.lambda_handler
+      MemorySize: 512
+      Timeout: 120
+      Environment:
+        Variables:
+          ATHENA_DB: !Ref BedrockLogsDatabase
+          ATHENA_TABLE: !Ref InvocationsTable
+          ATHENA_OUTPUT: !Sub "s3://${LogBucket}/athena-results/"
+          ATHENA_WORKGROUP: !Ref AthenaWorkgroup
+          LOG_BUCKET: !Ref LogBucket
+          LOG_PREFIX: !Sub "AWSLogs/${AWS::AccountId}/BedrockModelInvocationLogs"
+          LOG_REGION: !Ref AWS::Region
+      Policies:
+        - AthenaQueryFullAccess
+        - S3ReadPolicy:
+            BucketName: !Ref LogBucket
+        - S3WritePolicy:
+            BucketName: !Ref LogBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - glue:GetDatabase
+                - glue:GetTable
+                - glue:GetPartitions
+                - glue:GetPartition
+                - glue:BatchGetPartition
+              Resource: "*"
+      Events:
+        GetUsers:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ComplianceApi
+            Path: /users
+            Method: GET
+        GetStats:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ComplianceApi
+            Path: /stats
+            Method: GET
+        GetConversations:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ComplianceApi
+            Path: /conversations
+            Method: GET
+
+Outputs:
+  LogBucketName:
+    Value: !Ref LogBucket
+  BudgetApiEndpoint:
+    Value: !Sub "https://${BudgetApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  ComplianceApiEndpoint:
+    Value: !Sub "https://${ComplianceApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  ClaudeCodeAccessRoleArn:
+    Value: !GetAtt ClaudeCodeAccessRole.Arn
+  UserCostsTableName:
+    Value: !Ref UserCostsTable
+  UserBudgetTableName:
+    Value: !Ref UserBudgetTable
+  UserCostsLogTableName:
+    Value: !Ref UserCostsLogTable
