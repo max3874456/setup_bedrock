@@ -461,7 +461,7 @@ Resources:
           DYNAMODB_LOG_TABLE: !Ref UserCostsLogTable
           BLOCK_ALERT_FUNCTION_NAME: !Ref BlockAlertFunction
       Policies:
-        - AthenaQueryFullAccess
+        - AmazonAthenaFullAccess
         - S3ReadPolicy:
             BucketName: !Ref LogBucket
         - S3WritePolicy:
@@ -681,7 +681,7 @@ Resources:
           LOG_PREFIX: !Sub "AWSLogs/${AWS::AccountId}/BedrockModelInvocationLogs"
           LOG_REGION: !Ref AWS::Region
       Policies:
-        - AthenaQueryFullAccess
+        - AmazonAthenaFullAccess
         - S3ReadPolicy:
             BucketName: !Ref LogBucket
         - S3WritePolicy:
