@@ -119,6 +119,93 @@ SSO를 쓰지 않는다면 이 단계는 생략하고, `deploy.sh`가 생성한 
 2. 샌드박스 상태라면 AWS Support에 프로덕션 액세스 요청
 3. `--ses-sender-email` 옵션으로 스택을 재배포(`deploy.sh` 재실행)
 
+### 6. Claude Code 사용자 설정 (organization-managed)
+
+사용자별 Claude Code가 어떤 모델을 어떤 Bedrock 리소스로 호출할지 조직 차원에서 강제하려면
+**managed-settings.json**을 배포하세요. 이 파일은 사용자 홈(`~/.claude/settings.json`)이나
+프로젝트(`.claude/settings.json`) 설정보다 항상 우선하며, 사용자가 자신의 설정 파일을 고쳐도
+덮어쓸 수 없습니다.
+
+#### 파일 위치 (관리자 권한으로 배포, OS별 고정 경로)
+
+| OS | 경로 |
+|----|------|
+| macOS | `/Library/Application Support/ClaudeCode/managed-settings.json` |
+| Linux / WSL | `/etc/claude-code/managed-settings.json` |
+| Windows | `C:\Program Files\ClaudeCode\managed-settings.json` |
+
+설정 우선순위(높음 → 낮음): **Managed** > 커맨드라인 인자 > Local(`.claude/settings.local.json`)
+> Project(`.claude/settings.json`) > User(`~/.claude/settings.json`).
+
+#### 예시로 흔히 잘못 작성되는 필드들
+
+아래와 같은 형태를 종종 보게 되는데, **실제로는 존재하지 않거나 잘못된 필드가 섞여 있어
+의도한 통제가 조용히 무시됩니다**:
+
+```jsonc
+{
+  "model": "opus",
+  "availableModels": ["opus", "sonnet", "haiku"],
+  "modelOverrides": { "...": "..." },
+  "models": {                              // ❌ 이런 중첩 "models" 객체는 존재하지 않음
+    "allowed": ["..."],                    // ❌ 존재하지 않는 필드 (무시됨)
+    "default": "...",                      // ❌ 존재하지 않는 필드 (무시됨)
+    "enforceAllowedOnly": true              // ❌ 존재하지 않는 필드 (무시됨)
+  },
+  "version": "1.0",                         // ❌ settings.json 스키마에 없는 필드
+  "skipDangerousModePermissionPrompt": true, // ❌ 존재하지 않는 필드. 위험 작업 승인을
+                                              //    조직 차원에서 스킵시키는 공식 필드는 없음
+  "env": {
+    "ANTHROPIC_SMALL_FAST_MODEL": "..."      // ⚠️ deprecated. ANTHROPIC_DEFAULT_HAIKU_MODEL 사용
+  }
+}
+```
+
+#### 통제 목적에 맞는 올바른 형태
+
+모델 선택을 3개(Opus/Sonnet/Haiku)로 제한하고, 각 별칭을 계정 소유의 Application Inference
+Profile ARN에 고정하려면 다음과 같이 작성합니다. `<ACCOUNT_ID>`는 이 스택을 배포한 본인 계정
+ID로 채우세요:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_USE_BEDROCK": "1",
+    "AWS_REGION": "ap-northeast-2",
+    "AWS_PROFILE": "<your-profile>",
+    "ANTHROPIC_MODEL": "us.anthropic.claude-sonnet-5",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "us.anthropic.claude-sonnet-5",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "us.anthropic.claude-opus-4-8",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+  },
+  "model": "sonnet",
+  "availableModels": ["opus", "sonnet", "haiku"],
+  "enforceAvailableModels": true,
+  "modelOverrides": {
+    "claude-sonnet-5": "arn:aws:bedrock:ap-northeast-2:<ACCOUNT_ID>:application-inference-profile/<sonnet-profile-id>",
+    "claude-opus-4-8": "arn:aws:bedrock:ap-northeast-2:<ACCOUNT_ID>:application-inference-profile/<opus-profile-id>",
+    "claude-haiku-4-5-20251001-v1:0": "arn:aws:bedrock:ap-northeast-2:<ACCOUNT_ID>:application-inference-profile/<haiku-profile-id>"
+  },
+  "allowManagedPermissionRulesOnly": false
+}
+```
+
+필드 설명:
+
+| 필드 | 역할 |
+|------|------|
+| `env` | 모든 세션/서브프로세스에 강제 적용되는 환경변수. `AWS_PROFILE`을 여기 넣으면 사용자가 셸에서 다른 프로필로 덮어써도 Claude Code 실행 시에는 이 값이 적용됨 |
+| `model` | 세션 시작 시 기본 모델 별칭(`opus`/`sonnet`/`haiku`) |
+| `availableModels` + `enforceAvailableModels` | `/model` 피커에 노출되는 모델을 지정한 목록으로만 제한. `enforceAvailableModels: true`가 없으면 Default 옵션은 이 제한을 받지 않음 |
+| `modelOverrides` | 별칭/모델ID를 실제 Application Inference Profile ARN에 고정. 사용자가 ARN을 직접 지정하지 못하게 막는 핵심 필드 (이 값은 관리자만 관리하며, Claude Code는 시작 시 이 pin을 갱신하라는 알림도 띄우지 않음) |
+| `allowManagedPermissionRulesOnly` | (managed-settings 전용) `true`로 설정하면 사용자/프로젝트 설정이 `permissions.allow/ask/deny`를 추가로 정의하지 못하게 막음 |
+
+> `models.allowed`, `models.enforceAllowedOnly`, `skipDangerousModePermissionPrompt`,
+> 최상위 `version` 필드는 공식 스키마에 없으므로 **작성해도 조용히 무시됩니다.** 위험 작업
+> 승인(permission mode)을 조직 차원에서 통제하려면 `allowManagedPermissionRulesOnly`와
+> `permissions.allow/ask/deny`를 조합하세요. 최신 필드 목록은 항상
+> [공식 Settings 문서](https://code.claude.com/docs/en/settings)를 기준으로 확인하세요.
+
 ## ⚠️ 비용 차단이 적용되는 범위 (중요)
 
 이 시스템은 **비용 집계**와 **차단**의 적용 범위가 다릅니다. 이 차이를 모르고 배포하면
