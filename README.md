@@ -119,6 +119,56 @@ SSO를 쓰지 않는다면 이 단계는 생략하고, `deploy.sh`가 생성한 
 2. 샌드박스 상태라면 AWS Support에 프로덕션 액세스 요청
 3. `--ses-sender-email` 옵션으로 스택을 재배포(`deploy.sh` 재실행)
 
+## ⚠️ 비용 차단이 적용되는 범위 (중요)
+
+이 시스템은 **비용 집계**와 **차단**의 적용 범위가 다릅니다. 이 차이를 모르고 배포하면
+"대시보드에는 비용이 잡히는데 예산을 초과해도 차단이 안 된다" 는 상황이 발생합니다.
+
+### 비용 집계는 모든 호출을 잡는다
+
+`BedrockAthenaLogQueryLambda`는 Bedrock Model Invocation Logging이 기록한 **모든 호출**을
+`identity.arn` 기준으로 집계합니다. 어떤 IAM 사용자/역할로 호출했는지와 무관하게
+DynamoDB(`bedrock-budget-user-costs`)와 CloudWatch 대시보드에는 전부 반영됩니다.
+
+### 차단은 `ClaudeCodeAccessRole`을 assume한 경우에만 적용된다
+
+`BedrocBlockAlertLambda`가 예산 초과자를 차단하는 방식은, `BedrockBudgetDeny_1`~`_9` 관리형
+정책을 **특정 IAM 역할에 attach** 하는 것입니다. `infra/template.yaml`을 그대로 배포하면
+이 Deny 정책들은 **`ClaudeCodeAccessRole` 하나에만** 연결됩니다 (`setup-sso-integration.sh`를
+실행했다면 지정한 SSO 권한 세트 역할에도 추가로 연결됨).
+
+즉, 사용자가 Bedrock을 호출할 때 사용하는 자격증명의 **경로**에 따라 결과가 달라집니다:
+
+| 호출 경로 | 비용 집계 | 예산 초과 시 차단 |
+|-----------|-----------|-------------------|
+| `ClaudeCodeAccessRole` assume (README 기본 안내 방식) | ✅ | ✅ |
+| `setup-sso-integration.sh`로 연동한 SSO 권한 세트 | ✅ | ✅ |
+| 그 외 IAM 역할/사용자로 `bedrock:InvokeModel` 권한을 별도로 가진 경우 (예: AdministratorAccess, 다른 커스텀 정책, 다른 SSO 권한 세트) | ✅ (로그는 항상 남음) | ❌ (Deny 정책이 그 역할/사용자에 없으므로 차단되지 않음) |
+| 루트 계정 | ✅ | ❌ |
+
+**Deny는 Allow보다 항상 우선하지만, 애초에 그 사용자의 IAM 주체에 Deny 정책 자체가
+연결되어 있어야 효력이 있습니다.** 다른 경로로 Bedrock 호출 권한을 가진 사용자는
+Deny 정책이 존재하는지 자체를 모르기 때문에 예산을 초과해도 차단되지 않습니다.
+
+### 확실하게 차단을 강제하려면
+
+1. **Bedrock 호출 권한을 `ClaudeCodeAccessRole` (또는 SSO 연동된 권한 세트) 하나로만 제한**하세요.
+   다른 IAM 역할/사용자/그룹 정책에 `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream`
+   권한을 별도로 부여하지 않아야 이 시스템의 차단이 실제로 유효합니다.
+2. 팀에서 이미 사용 중인 다른 역할로 Bedrock을 호출해야 한다면, 그 역할에도
+   `BedrockBudgetDeny_1`~`_9` 정책을 수동으로 attach 하세요:
+   ```bash
+   for i in $(seq 1 9); do
+     aws iam attach-role-policy \
+       --role-name <다른-역할-이름> \
+       --policy-arn arn:aws:iam::<계정ID>:policy/BedrockBudgetDeny_$i
+   done
+   ```
+3. 정기적으로 계정 내 `bedrock:InvokeModel` 권한을 가진 모든 IAM 주체를
+   [IAM Access Analyzer](https://docs.aws.amazon.com/IAM/latest/UserGuide/what-is-access-analyzer.html)
+   나 `aws accessanalyzer` / `iam simulate-principal-policy` 로 점검해서, 의도치 않게
+   차단을 우회할 수 있는 경로가 늘어나지 않았는지 확인하세요.
+
 ## 운영
 
 ### 사용자별 예산 한도 변경
