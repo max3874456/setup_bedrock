@@ -49,6 +49,13 @@ bedrock/               - 원본 운영 문서 (참고용)
 
 ## 배포 절차
 
+### 0. 저장소 클론
+
+```bash
+git clone git@github.com:max3874456/setup_bedrock.git
+cd setup_bedrock
+```
+
 ### 1. 인프라 스택 배포
 
 ```bash
@@ -99,7 +106,14 @@ CloudFormation은 이 설정(계정 단위 리소스)을 지원하지 않으므�
 SSO를 쓰지 않는다면 이 단계는 생략하고, `deploy.sh`가 생성한 `ClaudeCodeAccess` IAM 역할을
 사용자가 직접 assume 하도록 안내하면 됩니다 (`--trusted-principal-arns`로 assume 가능한 주체를 지정).
 
-### 4. (선택) SES 알림 활성화
+### 4. 배포 확인
+
+5분 정도 지나면 EventBridge Scheduler가 `BedrockAthenaLogQueryLambda`를 자동 실행합니다.
+
+- CloudWatch Logs > `/aws/lambda/BedrockAthenaLogQueryLambda` 에서 `[INFO] Saved ... items` 로그 확인
+- DynamoDB `<prefix>-user-costs` 테이블에 당월(`month`) 항목이 생성되는지 확인
+
+### 5. (선택) SES 알림 활성화
 
 1. SES 콘솔 > Verified identities 에서 발신 이메일 인증
 2. 샌드박스 상태라면 AWS Support에 프로덕션 액세스 요청
