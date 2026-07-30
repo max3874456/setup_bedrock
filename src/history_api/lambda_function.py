@@ -10,6 +10,7 @@ import gzip
 import json
 import os
 import time
+from datetime import datetime, timedelta, timezone
 
 import boto3
 
@@ -22,6 +23,14 @@ LOG_PREFIX = os.environ.get("LOG_PREFIX", "AWSLogs")
 LOG_REGION = os.environ.get("LOG_REGION", "ap-northeast-2")
 
 MAX_CONVERSATION_RECORDS = 200
+
+KST = timezone(timedelta(hours=9))
+
+
+def _kst_date_to_utc_iso(date_str):
+    """'YYYY-MM-DD'(KST 자정 기준)를 Athena timestamp 비교용 UTC ISO 문자열로 변환."""
+    dt_kst = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=KST)
+    return dt_kst.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 athena_client = boto3.client("athena", region_name=LOG_REGION)
 s3_client = boto3.client("s3", region_name=LOG_REGION)
@@ -77,9 +86,9 @@ def handle_users(params):
 
     conditions = []
     if start_date:
-        conditions.append(f"\"timestamp\" >= '{start_date}T00:00:00Z'")
+        conditions.append(f"\"timestamp\" >= '{_kst_date_to_utc_iso(start_date)}'")
     if end_date:
-        conditions.append(f"\"timestamp\" < '{end_date}T00:00:00Z'")
+        conditions.append(f"\"timestamp\" < '{_kst_date_to_utc_iso(end_date)}'")
     where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
     query = f"""

@@ -296,3 +296,7 @@ aws cloudformation delete-stack --stack-name bedrock-budget --region ap-northeas
 S3 로그 버킷에 객체가 남아있으면 스택 삭제가 실패할 수 있습니다. 필요 시 버킷을 먼저 비우세요.
 Bedrock Model Invocation Logging 설정은 스택과 별개이므로, 더 이상 필요 없다면
 `aws bedrock delete-model-invocation-logging-configuration` 으로 직접 해제해야 합니다.
+
+## 변경 이력
+
+이 저장소의 버그 수정/기능 변경 내역은 날짜별로 [CHANGELOG.md](./CHANGELOG.md)에 기록됩니다.
