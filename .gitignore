@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .aws-sam/
 CHANGELOG.md
+*_배포본-분석.md
